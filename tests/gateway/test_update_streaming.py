@@ -322,6 +322,60 @@ class TestWatchUpdateProgress:
         # (may be cleared by the time we check since update finished)
 
     @pytest.mark.asyncio
+    async def test_prompt_sent_only_once_and_file_deleted(self, tmp_path):
+        """After forwarding the prompt, the watcher must delete .update_prompt.json
+        so it is not re-sent on the next poll interval.  Re-sending every 2s
+        causes Telegram flood control."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "telegram", "chat_id": "111", "user_id": "222",
+                   "session_key": "agent:main:telegram:dm:111"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_output.txt").write_text("output\n")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        # Write a prompt — the watcher should forward it then delete the file.
+        # We do NOT delete it ourselves; we verify the watcher does.
+        async def simulate_prompt_and_finish():
+            await asyncio.sleep(0.3)
+            prompt = {"prompt": "Restore? [Y/n]", "default": "y", "id": "test2"}
+            (hermes_home / ".update_prompt.json").write_text(json.dumps(prompt))
+            # Wait long enough for several poll cycles
+            await asyncio.sleep(1.0)
+            # Finish the update
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            task = asyncio.create_task(simulate_prompt_and_finish())
+            await runner._watch_update_progress(
+                poll_interval=0.1,
+                stream_interval=0.2,
+                timeout=10.0,
+            )
+            await task
+
+        # Count how many times the prompt text was sent via adapter.send
+        send_calls = [str(c) for c in mock_adapter.send.call_args_list]
+        prompt_sends = [s for s in send_calls if "Restore" in s]
+        assert len(prompt_sends) == 1, (
+            f"Prompt should be sent exactly once, but was sent {len(prompt_sends)} times. "
+            f"Indicates .update_prompt.json was not deleted after forwarding."
+        )
+
+        # The prompt file should have been deleted by the watcher
+        assert not (hermes_home / ".update_prompt.json").exists(), (
+            "Watcher should delete .update_prompt.json after forwarding"
+        )
+
+        # send_update_prompt (button path) should also be called at most once
+        if mock_adapter.send_update_prompt.called:
+            assert mock_adapter.send_update_prompt.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_cleans_up_on_completion(self, tmp_path):
         """All marker files are cleaned up when update finishes."""
         runner = _make_runner()
